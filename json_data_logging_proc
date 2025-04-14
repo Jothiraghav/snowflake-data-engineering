@@ -1,0 +1,184 @@
+use role sysadmin
+use database bakery_db;
+create schema external_json_orders;
+use warehouse bakery_wh;
+use schema external_json_orders;
+--sf stores semi-structured data in the variant data type.----------
+
+create stage park_inn_stage
+    storage_integration=bistro_integration
+    url='azure://orders007.blob.core.windows.net/orders';
+
+create table orders_park_inn_raw_stg(customer_orders variant,
+source_file_name varchar,load_ts timestamp)
+
+copy into orders_park_inn_raw_stg from (select $1,metadata$filename,current_timestamp()
+from @park_inn_stage)
+file_format=(type='json')
+on_error=abort_statement;
+
+select * from orders_park_inn_raw_stg
+
+----to check whether it is possible for the storage account not container---
+create stage overall_account
+ storage_integration=bistro_integration
+ url='azure://orders007.blob.core.windows.net/'
+ ---not possbile storage integration is connected to invidual container not storage account---
+select customer_orders:"Customer"::varchar as customer,
+    customer_orders:"Order date"::date as order_date,
+    customer_orders:"Orders"
+from orders_park_inn_raw_stg
+-----------------------------------------------------
+--Fully converted to relational table----------
+create or replace view orders_park_inn_stg as 
+    select customer_orders:"Customer"::varchar as customer,
+    customer_orders:"Order date"::date as order_date,
+    co.value:"Delivery date"::date as delivery_date,
+    do.value:"Baked good type"::varchar as baked_good_type,
+    do.value:"Quantity"::number as quantity
+    from orders_park_inn_raw_stg,
+    lateral flatten(input=> customer_orders:"Orders") co,
+    lateral flatten(input=> co.value:"Orders by day") do;
+
+select sum(quantity) as each_quantity,baked_good_type 
+from orders_park_inn_stg group by baked_good_type;
+
+describe view orders_park_inn_stg;
+
+------if json is in uniform format use 'strip_outer_object' - so that snowflake will treat
+--each json object in an array as a seperate row----
+create or replace file format json_format
+    type='json'
+    strip_outer_array=True;
+ (or)
+copy into table_name
+ from @<stage>
+ file_format=(type='json',strip_outer_array=true);
+--------------------------------------------------------------------
+----to combine all the orders info. to know about raw material info------
+use database bakery_db;
+create schema transform;
+use schema transform;
+
+create or replace view orders_combined_stg as
+select customer,order_date,delivery_date,baked_good_type,quantity,
+from bakery_db.orders.orders_stg
+union all
+select customer,order_date,delivery_date,baked_good_type,quantity
+from bakery_db.external_orders.orders_bistro_stg
+union all
+select customer,order_date,delivery_date,baked_good_type,quantity
+from bakery_db.external_json_orders.orders_park_inn_stg;
+
+select * from orders_combined_stg;
+
+---------need an target table that have combined_orders_combined that 
+---stores historical orders data
+create or replace table customer_orders_combined(
+customer varchar,order_date date,delivery_date date,baked_good_type varchar,
+quantity number);
+
+---create an stored procedure
+create or replace procedure load_customer_orders()
+returns varchar
+language sql
+as
+$$
+begin
+merge into customer_orders_combined tgt
+  using orders_combined_stg as src
+  on src.customer = tgt.customer and src.delivery_date = tgt.delivery_date and src.baked_good_type = tgt.baked_good_type
+  when matched then 
+    update set tgt.quantity = src.quantity
+  when not matched then
+    insert (customer, order_date, delivery_date, baked_good_type, quantity)
+    values(src.customer, src.order_date, src.delivery_date, src.baked_good_type, src.quantity);
+
+return 'Load completed'||sqlrowcount||'rows affected';
+end;
+$$
+;
+
+use role sysadmin;
+use database bakery_db;
+use schema transform;
+call load_customer_orders();
+
+SHOW GRANTS ON PROCEDURE load_customer_orders();
+GRANT EXECUTE ON PROCEDURE transform.load_customer_orders() TO ROLE SYSADMIN;
+
+SHOW PROCEDURES LIKE 'load_customer_orders';
+GRANT USAGE ON SCHEMA transform TO ROLE SYSADMIN;
+
+select * from customer_orders_combined;
+
+----Event logging table for the account---
+
+use role sysadmin;
+use schema transform;
+create event table bakery_events;
+
+use role accountadmin;
+alter account set event_table=bakery_db.transform.bakery_events;
+
+grant modify log level on account to role sysadmin;
+------------adding log mechanism to procedure and exception included---
+create or replace procedure load_customer_orders()
+returns varchar
+language sql
+as
+$$
+begin
+system$log_debug('load_customer_orders_begin');
+merge into customer_orders_combined tgt
+  using orders_combined_stg as src
+  on src.customer = tgt.customer and src.delivery_date = tgt.delivery_date and src.baked_good_type = tgt.baked_good_type
+  when matched then 
+    update set tgt.quantity = src.quantity
+  when not matched then
+    insert (customer, order_date, delivery_date, baked_good_type, quantity)
+    values(src.customer, src.order_date, src.delivery_date, src.baked_good_type, src.quantity);
+exception
+    when other then
+    return 'load failed with..'||SQLERRM;
+return 'Load completed'||sqlrowcount||'rows affected';
+end;
+$$
+;
+
+alter procedure load_customer_orders() set log_level=debug;
+
+--------creating summary table for orders-----------------
+use role sysadmin;
+use database bakery_db;
+use schema transform;
+create table summary_orders(delivery_date date,baked_good_type varchar,
+total_quantity number);
+
+create or replace procedure LOAD_CUSTOMER_SUMMARY_ORDERS()
+returns varchar
+language sql
+as
+$$
+begin
+  SYSTEM$LOG_DEBUG('LOAD_CUSTOMER_SUMMARY_ORDERS begin ');
+  
+  truncate table SUMMARY_ORDERS;
+  insert into SUMMARY_ORDERS(delivery_date, baked_good_type, total_quantity)
+  select delivery_date, baked_good_type, sum(quantity) as total_quantity
+  from CUSTOMER_ORDERS_COMBINED
+  group by all;
+  return 'Load completed. ' || SQLROWCOUNT || ' rows inserted.';
+exception
+  when other then
+    return 'Load failed with error message: ' || SQLERRM;
+end;
+$$
+;
+
+call LOAD_CUSTOMER_SUMMARY_ORDERS()
+
+select * from SUMMARY_ORDERS order by delivery_date desc;
+
+
+select * from bakery_events order by timestamp desc;
