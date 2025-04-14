@@ -1,0 +1,108 @@
+use role accountadmin;
+create storage integration speedy_integration
+ type=external_stage
+ storage_provider='azure'
+ enabled=true
+ azure_tenant_id='8726fc48-bfe0-42a9-b407-87fc1445a306'
+ storage_allowed_locations = ('azure://speedyorders007.blob.core.windows.net/speedyservicefiles');
+
+describe integration speedy_integration;
+
+grant usage on integration speedy_integration to role sysadmin;
+
+use role sysadmin;
+use warehouse bakery_wh;
+use database bakery_db;
+create schema delivery_orders;
+use schema delivery_orders;
+
+create stage speedy_stage
+    storage_integration=speedy_integration
+    url='azure://speedyorders007.blob.core.windows.net/speedyservicefiles'
+    file_format=(type=json);
+
+list @speedy_stage;
+
+select $1 from @speedy_stage;
+
+select $1:"Order id",$1:"Order datetime",$1:"Items" from @speedy_stage
+
+create table speedy_orders_raw_stg(
+order_id varchar,order_datetime timestamp,items variant,
+source_file_name varchar,load_ts timestamp)
+
+queue_url='https://speedyorders007.queue.core.windows.net/ordersqueue'-
+
+use role accountadmin;
+create notification integration speedy_queue_integration
+enabled=true
+type=queue
+notification_provider=azure_storage_queue
+azure_storage_queue_primary_uri='https://speedyorders007.queue.core.windows.net/ordersqueue'
+azure_tenant_id='8726fc48-bfe0-42a9-b407-87fc1445a306'
+
+describe notification integration speedy_queue_integration
+
+grant usage on integration speedy_queue_integration to role sysadmin;
+-----------------creating pipe object
+
+use role sysadmin;
+create pipe speedy_pipe
+    auto_ingest=true
+    integration='SPEEDY_QUEUE_INTEGRATION'
+    as
+    copy into speedy_orders_raw_stg from (
+    select $1:"Order id",$1:"Order datetime",$1:"Items",
+    metadata$filename,current_timestamp() from @speedy_stage);
+
+SHOW INTEGRATIONS;
+
+alter pipe speedy_pipe refresh; 
+
+select * from speedy_orders_raw_stg;
+
+select system$pipe_status('speedy_pipe')
+
+-------------check the below one
+select * from table(information_schema.copy_history(
+table_name => 'speedy_orders_raw_stg',
+start_time => dateadd(day,-1,current_timestamp())));
+--------
+------Dynamic table----------------
+create dynamic table speedy_orders
+    target_lag='1 minute'
+    warehouse=bakery_wh
+    as
+    select order_id,order_datetime,
+    value:"Item"::varchar as baked_good_type,
+    value:"Quantity"::number as quantity,
+    source_file_name,load_ts
+    from speedy_orders_raw_stg,
+    lateral flatten(input=> items);
+
+select * from speedy_orders order by order_datetime desc;
+
+select * from table(information_schema.dynamic_table_refresh_history())
+order by refresh_start_time desc;
+
+select * from table(information_schema.dynamic_table_graph_history())
+-------To suspend & resume pipe and dynamic table------------
+
+ALTER DYNAMIC TABLE speedy_orders SUSPEND;
+
+SHOW DYNAMIC TABLES;
+
+ALTER DYNAMIC TABLE speedy_orders RESUME;
+
+ALTER PIPE speedy_pipe SET PIPE_EXECUTION_PAUSED = TRUE;
+
+show pipes
+
+ALTER PIPE speedy_pipe SET PIPE_EXECUTION_PAUSED = FALSE;
+
+-------------outbound as csv for external stage(blob storage/s3)
+COPY INTO @my_stage/outbound_folder/
+FROM my_table
+FILE_FORMAT = (TYPE = 'CSV');   
+
+
