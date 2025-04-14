@@ -1,0 +1,131 @@
+use role accountadmin;
+create storage integration bistro_integration
+ type=external_stage
+ storage_provider='azure'
+ enabled=true
+ azure_tenant_id='8726fc48-bfe0-42a9-b407-87fc1445a306'
+ storage_allowed_locations = ('azure://orders007.blob.core.windows.net/orders');
+
+describe storage integration bistro_integration;
+
+grant usage on integration bistro_integration to role sysadmin;
+
+use role sysadmin;
+use database bakery_db;
+create schema external_orders;
+use schema external_orders;
+
+create stage bistro_stage
+    storage_integration=bistro_integration
+    url='azure://orders007.blob.core.windows.net/orders';
+-----------------------Not working-Shared Access Signature------------------------------
+create stage bistro_sas_stage
+    url='azure://orders007.blob.core.windows.net/orders'
+    credentials=(azure_sas_token='sp=r&st=2025-03-20T14:08:34Z&se=2025-03-21T22:08:34Z&spr=https&sv=2024-11-04&sr=c&sig=20pcbOkqd6BOGBDYPxLLaXEVwEVhGJZFEe3ob0sQEFY%3D');
+------------------------Need to check it above sas-------------------------
+list @bistro_stage;
+
+use database bakery_db;
+use schema external_orders;
+create table orders_bistro_stg(customer varchar,order_date date,delivery_date date,
+baked_good_type varchar,quantity number,source_file_name varchar,load_ts timestamp);
+
+use warehouse bakery_wh;
+use database bakery_db;
+use schema external_orders;
+copy into orders_bistro_stg from(select $1,$2,$3,$4,$5,metadata$filename,
+  current_timestamp() from @bistro_stage)
+  file_format=(type=csv,skip_header=1)
+  on_error=abort_statement
+  force=true
+
+select * from information_schema.load_history order by last_load_time desc;
+
+truncate bakery_db.external_orders.orders_bistro_stg;
+select * from bakery_db.external_orders.orders_bistro_stg;
+
+------------------------To load based on a pattern-----------------
+copy into orders_bistro_stg from(select $1,$2,$3,$4,$5,metadata$filename,
+  current_timestamp() from @bistro_stage)
+  file_format=(type=csv,skip_header=1)
+  --pattern='.*2023-08.*\.csv$'
+  ---files=('Orders_2023-08-04.csv')
+  files=('Orders_2023-08-04.csv','Orders_2023-07-09.csv')
+  on_error=abort_statement
+  force=true
+-------------------------------------------------------------------
+
+describe storage integration BISTRO_INTEGRATION;
+describe stage bistro_stage;
+-----------------------------File format creation----------------------
+create file format orders_csv_format
+    type=csv
+    field_delimiter=','
+    skip_header=1;
+-----------stage metadata with directory tables------------------------
+alter stage bistro_stage
+set directory=(enable=true);
+
+select * from directory (@bistro_stage);
+
+alter stage bistro_stage refresh; --to refresh manually-----
+-----------------------------------------------------------------------
+------------External Table------------------------------------------
+USE DATABASE BAKERY_DB;
+USE SCHEMA EXTERNAL_ORDERS;
+CREATE OR REPLACE FILE FORMAT ORDERS_CSV_FORMAT
+TYPE = 'CSV'
+FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+SKIP_HEADER = 1
+NULL_IF = ('NULL', 'null', '');
+
+
+
+CREATE OR REPLACE EXTERNAL TABLE ORDERS_BISTRO_EXT (
+  customer VARCHAR AS (VALUE:c1::VARCHAR),
+  order_date DATE AS (VALUE:c2::DATE),
+  delivery_date DATE AS (VALUE:c3::DATE),
+  baked_good_type VARCHAR AS (VALUE:c4::VARCHAR),
+  quantity NUMBER AS (VALUE:c5::NUMBER),
+  source_file_name VARCHAR AS METADATA$FILENAME
+)
+LOCATION = @BISTRO_STAGE
+AUTO_REFRESH = FALSE
+FILE_FORMAT = ORDERS_CSV_FORMAT;
+
+
+alter external table ORDERS_BISTRO_EXT refresh;
+
+select * from ORDERS_BISTRO_EXT;
+desc table ORDERS_BISTRO_EXT;
+----------why VALUE column additional included at the front------------
+---------------Materialized view------------------auto-refresh if external table is refresh
+-----taken care by snowflake itself ------------
+create materialized view orders_bistro_mv as select customer,order_date,
+delivery_date,baked_good_type,quantity from orders_bistro_ext;
+
+select * from orders_bistro_mv
+drop materialized view orders_bistro_mv
+
+
+
+
+
+
+
+
+
+
+
+
+----------------------lets check it at last or in next chapter--------------
+create stage bistro_account
+ storage_integration=bistro_integration
+ url='azure://orders007.blob.core.windows.net/'
+
+---------to convert a tabluar format to json format--------
+select OBJECT_AGG(cast(column_name as variant),cast(data_type as variant))
+from information_schema.columns where 
+table_schema='ORDERS' and table_name like 'ORDER%';
+
+
