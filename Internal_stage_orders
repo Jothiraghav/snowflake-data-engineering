@@ -1,0 +1,151 @@
+use role sysadmin;
+create database BAKERY_DB
+create schema ORDERS
+create warehouse BAKERY_WH with warehouse_size='x-small'
+
+use role sysadmin
+use database bakery_db
+use schema orders
+create table ORDERS_STG (customer varchar,order_date date,delivery_date date,baked_good_type varchar,quantity number,source_file_name varchar,load_ts timestamp);
+
+create stage ORDERS_STAGE;
+list @ORDERS_STAGE;
+select $1, $2, $3, $4, $5 from @ORDERS_STAGE;
+
+use database BAKERY_DB;
+use schema ORDERS;
+copy into ORDERS_STG
+from (
+  select $1, $2, $3, $4, $5, metadata$filename, current_timestamp() 
+  from @ORDERS_STAGE
+)
+file_format = (type = csv, skip_header = 1)
+on_error = abort_statement
+purge = true;
+
+select * from ORDERS_STG
+
+use database BAKERY_DB;
+use schema ORDERS;
+create or replace table CUSTOMER_ORDERS (customer varchar,order_date date,delivery_date date,baked_good_type varchar,quantity number,source_file_name varchar,load_ts timestamp);
+
+
+-----------random analysis------------------
+select customer,order_date,delivery_date,sum(quantity) from orders_stg where delivery_date='2023-07-12'
+group by customer,order_date,delivery_date
+
+select customer,baked_good_type,sum(quantity) from orders_stg where delivery_date='2023-07-12'
+group by baked_good_type,customer
+
+select * from orders_stg where delivery_date='2023-07-12' and customer like 'Coffee%'
+---------random analysis--------------------
+
+-----------------------Merge newly added orders to historical table------------
+merge into CUSTOMER_ORDERS tgt
+-- the source table
+using ORDERS_STG as src 
+-- the columns that ensure uniqueness
+on src.customer = tgt.customer 
+  and src.delivery_date = tgt.delivery_date 
+  and src.baked_good_type = tgt.baked_good_type
+-- update the target table with the values from the source table
+when matched then 
+  update set tgt.quantity = src.quantity, 
+    tgt.source_file_name = src.source_file_name, 
+    tgt.load_ts = current_timestamp()
+-- insert new values from the source table into the target table
+when not matched then
+  insert (customer, order_date, delivery_date, baked_good_type, 
+    quantity, source_file_name, load_ts)
+  values(src.customer, src.order_date, src.delivery_date, 
+    src.baked_good_type, src.quantity, src.source_file_name,
+    current_timestamp());
+---------------------------------------------------------------------------------
+select * from CUSTOMER_ORDERS order by (delivery_date,quantity) desc;
+-----------use brackets to make desc order for both delivery_date,quantity column------
+use database BAKERY_DB;
+use schema ORDERS;
+create table SUMMARY_ORDERS(
+  delivery_date date,
+  baked_good_type varchar,
+  total_quantity number
+);
+
+select delivery_date, baked_good_type, sum(quantity) as total_quantity from CUSTOMER_ORDERS
+group by all order by delivery_date desc;
+
+insert into SUMMARY_ORDERS(delivery_date, baked_good_type, total_quantity)
+  select delivery_date, baked_good_type, sum(quantity) as total_quantity
+  from CUSTOMER_ORDERS group by all order by delivery_date desc;
+
+select * from SUMMARY_ORDERS
+
+---------------------------Task creation---------------------------
+use database BAKERY_DB;
+use schema ORDERS;
+create or replace task PROCESS_ORDERS
+  warehouse = BAKERY_WH
+  schedule = '10 M'
+as
+begin
+  truncate table ORDERS_STG;
+  copy into ORDERS_STG
+  from (
+    select $1, $2, $3, $4, $5, metadata$filename, current_timestamp() 
+    from @ORDERS_STAGE
+  )
+  file_format = (type = csv, skip_header = 1)
+  on_error = abort_statement
+  purge = true;
+
+  merge into CUSTOMER_ORDERS tgt
+  using ORDERS_STG as src
+  on src.customer = tgt.customer and src.delivery_date = tgt.delivery_date and src.baked_good_type = tgt.baked_good_type
+  when matched then 
+    update set tgt.quantity = src.quantity, tgt.source_file_name = src.source_file_name, tgt.load_ts = current_timestamp()
+  when not matched then
+    insert (customer, order_date, delivery_date, baked_good_type, quantity, source_file_name, load_ts)
+    values(src.customer, src.order_date, src.delivery_date, src.baked_good_type, src.quantity, src.source_file_name, current_timestamp());
+
+  truncate table SUMMARY_ORDERS;
+  insert into SUMMARY_ORDERS(delivery_date, baked_good_type, total_quantity)
+    select delivery_date, baked_good_type, sum(quantity) as total_quantity
+    from CUSTOMER_ORDERS
+    group by all order by delivery_date desc;
+end;
+---------------------------Task End--------------------------------
+---------------------Initially task was suspend while creation------------
+-------execute task privilege/command is not for sysadmin role------------
+use role accountadmin;
+grant execute task on account to role sysadmin;
+use role sysadmin;
+-------------------Resume the task to run it in schedule---------
+alter task PROCESS_ORDERS resume;
+-------------------To know the task history---------------
+select *
+  from table(information_schema.task_history())
+  order by scheduled_time desc;
+-----------------------checking------------------------------
+ truncate table SUMMARY_ORDERS;
+select * from SUMMARY_ORDERS order by delivery_date desc
+
+insert into SUMMARY_ORDERS(delivery_date, baked_good_type, total_quantity)
+    select delivery_date, baked_good_type, sum(quantity) as total_quantity
+    from CUSTOMER_ORDERS
+    group by all order by delivery_date desc;
+---NOTE:ORDER BY clause in an INSERT ... SELECT statement does not guarantee the order of data stored. You should always use ORDER BY when selecting from the table if you need sorted results.----------
+alter task PROCESS_ORDERS suspend;
+
+list @ORDERS_STAGE
+
+alter task PROCESS_ORDERS
+set schedule = 'using cron 12 0 18 3 * UTC'
+
+alter task PROCESS_ORDERS resume;
+
+describe task PROCESS_ORDERS
+
+select current_timestamp()
+
+select * from table(information_schema.task_history()) order by
+scheduled_time desc;
